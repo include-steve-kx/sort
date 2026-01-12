@@ -66,6 +66,31 @@ To display the results you need to:
   $ python sort.py --display
   ```
 
+ln -s /Users/stevekx/Desktop/github-projects/sort/MOT15 mot_benchmark
+python sort.py --display
+
+### Websocket bridge mode (replay -> SORT -> downstream)
+
+If you have a replay process that streams:
+- video + detection metadata on `ws://localhost:5001` (binary: `[len][json][jpeg]`)
+- NMEA on `ws://127.0.0.1:3636`
+- control on `ws://0.0.0.0:6001`
+
+…you can run the SORT bridge to consume those streams, assign stable IDs, and re-broadcast:
+
+```
+$ python sort-3d.py
+```
+
+Defaults (configurable via CLI flags):
+- Downstream **video**: `ws://0.0.0.0:5002`
+- Downstream **NMEA**: `ws://0.0.0.0:3637`
+- Downstream **control**: `ws://0.0.0.0:6002`
+
+In the outgoing video metadata, only **confirmed** bboxes are sent downstream. For those bboxes, `obj_id` is replaced with the tracker ID (and the original is preserved as `source_obj_id`).
+
+Track confirmation:
+- To mimic the “confirmed-only” behavior (similar to original SORT without the warm-up exception), the bridge only assigns an ID once a track reaches `min_hits` consecutive matches.
 
 ### Main Results
 
