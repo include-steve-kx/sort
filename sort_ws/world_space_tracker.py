@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from filterpy.kalman import KalmanFilter
 
-from .tracker import linear_assignment  # reuse lap/scipy wrapper
+from .image_space_tracker import linear_assignment  # reuse lap/scipy wrapper
 from .world_transform import heading_diff_deg
 
 
@@ -167,7 +167,7 @@ def associate_world_detections_to_trackers(
     return matches_arr, np.array(unmatched_dets, dtype=int), np.array(unmatched_trks, dtype=int)
 
 
-class WorldSort:
+class WorldSpaceSort:
     """
     SORT-like tracker operating on world-space (ENU) point measurements.
 
@@ -183,19 +183,21 @@ class WorldSort:
     def __init__(
         self,
         *,
-        max_age: int = 20,
-        min_hits: int = 5,
-        max_distance_m: float = 30.0,
-        beta_heading: float = 0.0,
-        gamma_confidence: float = 0.0,
-        new_track_min_confidence: float = 0.0,
+        # World-space tracker parameters (prefixed for clarity at call sites / CLI wiring).
+        world_space_max_age: int = 20,
+        world_space_min_hits: int = 5,
+        world_space_max_distance_m: float = 30.0,
+        world_space_beta_heading: float = 0.0,
+        world_space_gamma_confidence: float = 0.0,
+        world_space_new_track_min_confidence: float = 0.0,
     ):
-        self.max_age = int(max_age)
-        self.min_hits = int(min_hits)
-        self.max_distance_m = float(max_distance_m)
-        self.beta_heading = float(beta_heading)
-        self.gamma_confidence = float(gamma_confidence)
-        self.new_track_min_confidence = float(new_track_min_confidence)
+        # Keep attribute names short/stable for runtime introspection/logging.
+        self.max_age = int(world_space_max_age)
+        self.min_hits = int(world_space_min_hits)
+        self.max_distance_m = float(world_space_max_distance_m)
+        self.beta_heading = float(world_space_beta_heading)
+        self.gamma_confidence = float(world_space_gamma_confidence)
+        self.new_track_min_confidence = float(world_space_new_track_min_confidence)
 
         self.trackers: List[KalmanPointTracker] = []
         self.frame_count = 0

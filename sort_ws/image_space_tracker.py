@@ -276,7 +276,7 @@ class KalmanBoxTracker:
         return convert_x_to_bbox(self.kf.x)
 
 
-class SortWithExtras:
+class ImageSpaceSort:
     """
     SORT wrapper that assigns stable IDs to incoming per-frame detections.
 
@@ -291,26 +291,24 @@ class SortWithExtras:
 
     def __init__(
         self,
-        # max_age: int = 10,
-        # min_hits: int = 1,
-        max_age: int = 20,
-        min_hits: int = 20,
-        iou_threshold: float = 0.1,
-        # alpha_distance: float = 0.15,
-        alpha_distance: float = 0.0,
-        # beta_heading: float = 0.10,
-        beta_heading: float = 0.0,
-        # gamma_confidence: float = 0.05,
-        gamma_confidence: float = 0.0,
-        new_track_min_confidence: float = 0.0,
+        *,
+        # Image-space tracker parameters (prefixed for clarity at call sites / CLI wiring).
+        image_space_max_age: int = 20,
+        image_space_min_hits: int = 20,
+        image_space_iou_threshold: float = 0.1,
+        image_space_alpha_distance: float = 0.0,
+        image_space_beta_heading: float = 0.0,
+        image_space_gamma_confidence: float = 0.0,
+        image_space_new_track_min_confidence: float = 0.0,
     ):
-        self.max_age = int(max_age)
-        self.min_hits = int(min_hits)
-        self.iou_threshold = float(iou_threshold)
-        self.alpha_distance = float(alpha_distance)
-        self.beta_heading = float(beta_heading)
-        self.gamma_confidence = float(gamma_confidence)
-        self.new_track_min_confidence = float(new_track_min_confidence)
+        # Keep attribute names short/stable for runtime introspection/logging.
+        self.max_age = int(image_space_max_age)
+        self.min_hits = int(image_space_min_hits)
+        self.iou_threshold = float(image_space_iou_threshold)
+        self.alpha_distance = float(image_space_alpha_distance)
+        self.beta_heading = float(image_space_beta_heading)
+        self.gamma_confidence = float(image_space_gamma_confidence)
+        self.new_track_min_confidence = float(image_space_new_track_min_confidence)
 
         self.trackers: List[KalmanBoxTracker] = []
         self.frame_count = 0

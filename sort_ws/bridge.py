@@ -12,8 +12,8 @@ from websockets.server import WebSocketServerProtocol
 
 from .codec import decode_video_message, encode_video_message
 from .ego import EgoSmoother, EgoStateStore
-from .tracker import SortWithExtras
-from .world_tracker import WorldSort
+from .image_space_tracker import ImageSpaceSort
+from .world_space_tracker import WorldSpaceSort
 from .world_transform import detection_to_world_latlon
 
 
@@ -31,13 +31,13 @@ class BridgeConfig:
 
     reconnect_delay_s: float = 1.0
 
-    # Tracking mode: "world_space" or "local_space"
+    # Tracking mode: "world_space" or "image_space"
     mode: str = "world_space"
 
     # World-tracking / camera params (used when mode == "world_space")
-    cv_width_px: int = 1920
-    fov_x_deg: float = 90.0
-    camera_yaw_offset_deg: float = 0.0
+    world_space_cv_width_px: int = 1920
+    world_space_fov_x_deg: float = 90.0
+    world_space_camera_yaw_offset_deg: float = 0.0
 
     # Logging
     # If > 0, print a simple progress line every N upstream video frames.
@@ -81,7 +81,7 @@ def _ws_url(host: str, port: int) -> str:
     return f"ws://{host}:{port}"
 
 
-def _track_image_space(bboxes: list, tracker: SortWithExtras) -> List[Dict[str, Any]]:
+def _track_image_space(bboxes: list, tracker: ImageSpaceSort) -> List[Dict[str, Any]]:
     assigned = tracker.assign(bboxes)
     tracked_bboxes: List[Dict[str, Any]] = []
     for det, track_id in zip(bboxes, assigned):
@@ -101,7 +101,7 @@ def _track_image_space(bboxes: list, tracker: SortWithExtras) -> List[Dict[str, 
 async def _track_world_space(
     *,
     bboxes: list,
-    world_tracker: WorldSort,
+    world_tracker: WorldSpaceSort,
     ego_store: EgoStateStore,
     cfg: BridgeConfig,
 ) -> List[Dict[str, Any]]:
@@ -109,7 +109,7 @@ async def _track_world_space(
     if ego.latlon is None or ego.heading_deg is None or ego.ref_latlon is None:
         return []
 
-    fov_x_rad = float(cfg.fov_x_deg) * 3.141592653589793 / 180.0
+    fov_x_rad = float(cfg.world_space_fov_x_deg) * 3.141592653589793 / 180.0
     local_ref = ego.ref_latlon
 
     world_dets: List[Dict[str, Any]] = []
@@ -132,9 +132,9 @@ async def _track_world_space(
             ego_heading_deg=float(ego.heading_deg),
             x_bottom_center_px=float(x_bottom_center),
             distance_m=float(distance_m),
-            image_width_px=float(cfg.cv_width_px),
+            image_width_px=float(cfg.world_space_cv_width_px),
             fov_x_rad=fov_x_rad,
-            camera_yaw_offset_deg=float(cfg.camera_yaw_offset_deg),
+            camera_yaw_offset_deg=float(cfg.world_space_camera_yaw_offset_deg),
             local_ref=local_ref,
         )
         det2 = dict(det)
@@ -159,8 +159,8 @@ async def _track_world_space(
 
 async def _upstream_video_loop(
     cfg: BridgeConfig,
-    image_tracker: SortWithExtras,
-    world_tracker: Optional[WorldSort],
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort],
     ego_store: Optional[EgoStateStore],
     video_hub: BroadcastHub,
 ) -> None:
@@ -189,7 +189,7 @@ async def _upstream_video_loop(
                         vm.metadata["tracked_space"] = "world_space"
                     else:
                         tracked_bboxes = _track_image_space(bboxes, image_tracker)
-                        vm.metadata["tracked_space"] = "local_space"
+                        vm.metadata["tracked_space"] = "image_space"
 
                     vm.metadata["bboxes"] = tracked_bboxes
                     vm.metadata["tracked"] = True
@@ -308,8 +308,8 @@ async def _downstream_control_handler(
 
 async def run_bridge(
     cfg: BridgeConfig,
-    image_tracker: SortWithExtras,
-    world_tracker: Optional[WorldSort] = None,
+    image_tracker: ImageSpaceSort,
+    world_tracker: Optional[WorldSpaceSort] = None,
     ego_store: Optional[EgoStateStore] = None,
 ) -> None:
     video_hub = BroadcastHub("video")
@@ -375,21 +375,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--downstream-nmea-port", type=int, default=3637)
     p.add_argument("--downstream-control-port", type=int, default=6002)
 
-    # Tracker params
-    # p.add_argument("--max-age", type=int, default=10)
-    # p.add_argument("--min-hits", type=int, default=1)
-    # p.add_argument("--iou-threshold", type=float, default=0.3)
-    # p.add_argument("--alpha-distance", type=float, default=0.15)
-    # p.add_argument("--beta-heading", type=float, default=0.10)
-    # p.add_argument("--gamma-confidence", type=float, default=0.05)
-    # p.add_argument("--new-track-min-confidence", type=float, default=0.0)
-    p.add_argument("--max-age", type=int, default=40)
-    p.add_argument("--min-hits", type=int, default=300)
-    p.add_argument("--iou-threshold", type=float, default=0.1)
-    p.add_argument("--alpha-distance", type=float, default=0.15)
-    p.add_argument("--beta-heading", type=float, default=0.0)
-    p.add_argument("--gamma-confidence", type=float, default=0.0)
-    p.add_argument("--new-track-min-confidence", type=float, default=0.0)
+    # Image-space tracker params (shown in --help)
+    p.add_argument("--image-space-max-age", dest="image_space_max_age", type=int, default=40)
+    p.add_argument("--image-space-min-hits", dest="image_space_min_hits", type=int, default=300)
+    p.add_argument("--image-space-iou-threshold", dest="image_space_iou_threshold", type=float, default=0.1)
+    p.add_argument("--image-space-alpha-distance", dest="image_space_alpha_distance", type=float, default=0.15)
+    p.add_argument("--image-space-beta-heading", dest="image_space_beta_heading", type=float, default=0.0)
+    p.add_argument("--image-space-gamma-confidence", dest="image_space_gamma_confidence", type=float, default=0.0)
+    p.add_argument(
+        "--image-space-new-track-min-confidence",
+        dest="image_space_new_track_min_confidence",
+        type=float,
+        default=0.0,
+    )
 
     p.add_argument("--reconnect-delay-s", type=float, default=1.0)
 
@@ -398,19 +396,61 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mode",
         type=str,
         default="world_space",
-        choices=["world_space", "local_space"],
-        help='Tracking mode. "world_space" uses NMEA ego lat/lon/heading and tracks in ENU meters. "local_space" runs original image-space SORT.',
+        choices=["world_space", "image_space"],
+        help='Tracking mode. "world_space" uses NMEA ego lat/lon/heading and tracks in ENU meters. "image_space" runs image-space SORT.',
     )
-    p.add_argument("--cv-width-px", type=int, default=1920, help="CV image width in pixels (used to compute bearing from x pixel).")
-    p.add_argument("--fov-x-deg", type=float, default=55.3, help="Camera horizontal field-of-view in degrees.")
-    p.add_argument("--camera-yaw-offset-deg", type=float, default=0.0, help="Yaw offset between camera forward and boat forward (degrees).")
+    p.add_argument(
+        "--world-space-cv-width-px",
+        dest="world_space_cv_width_px",
+        type=int,
+        default=1920,
+        help="CV image width in pixels (used to compute bearing from x pixel).",
+    )
+    p.add_argument(
+        "--world-space-fov-x-deg",
+        dest="world_space_fov_x_deg",
+        type=float,
+        default=55.3,
+        help="Camera horizontal field-of-view in degrees.",
+    )
+    p.add_argument(
+        "--world-space-camera-yaw-offset-deg",
+        dest="world_space_camera_yaw_offset_deg",
+        type=float,
+        default=0.0,
+        help="Yaw offset between camera forward and boat forward (degrees).",
+    )
 
-    p.add_argument("--world-max-age", type=int, default=300)
-    p.add_argument("--world-min-hits", type=int, default=40)
-    p.add_argument("--world-max-distance-m", type=float, default=50.0, help="Max world-space (meters) to allow a detection to match a track.")
-    p.add_argument("--world-beta-heading", type=float, default=0.0, help="Weight for target heading difference in world association cost.")
-    p.add_argument("--world-gamma-confidence", type=float, default=0.0, help="Weight for (1-confidence) in world association cost.")
-    p.add_argument("--world-new-track-min-confidence", type=float, default=0.0)
+    # World-space tracker params (shown in --help)
+    p.add_argument("--world-space-max-age", dest="world_space_max_age", type=int, default=300)
+    p.add_argument("--world-space-min-hits", dest="world_space_min_hits", type=int, default=40)
+    p.add_argument(
+        "--world-space-max-distance-m",
+        dest="world_space_max_distance_m",
+        type=float,
+        default=50.0,
+        help="Max world-space (meters) to allow a detection to match a track.",
+    )
+    p.add_argument(
+        "--world-space-beta-heading",
+        dest="world_space_beta_heading",
+        type=float,
+        default=0.0,
+        help="Weight for target heading difference in world association cost.",
+    )
+    p.add_argument(
+        "--world-space-gamma-confidence",
+        dest="world_space_gamma_confidence",
+        type=float,
+        default=0.0,
+        help="Weight for (1-confidence) in world association cost.",
+    )
+    p.add_argument(
+        "--world-space-new-track-min-confidence",
+        dest="world_space_new_track_min_confidence",
+        type=float,
+        default=0.0,
+    )
 
     p.add_argument(
         "--log-every-n-frames",
@@ -424,6 +464,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def cli_main(argv: Optional[list[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
+    mode = str(args.mode)
     cfg = BridgeConfig(
         upstream_host=args.upstream_host,
         upstream_video_port=args.upstream_video_port,
@@ -434,34 +475,34 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         downstream_nmea_port=args.downstream_nmea_port,
         downstream_control_port=args.downstream_control_port,
         reconnect_delay_s=args.reconnect_delay_s,
-        mode=str(args.mode),
-        cv_width_px=int(args.cv_width_px),
-        fov_x_deg=float(args.fov_x_deg),
-        camera_yaw_offset_deg=float(args.camera_yaw_offset_deg),
+        mode=mode,
+        world_space_cv_width_px=int(args.world_space_cv_width_px),
+        world_space_fov_x_deg=float(args.world_space_fov_x_deg),
+        world_space_camera_yaw_offset_deg=float(args.world_space_camera_yaw_offset_deg),
         log_every_n_frames=int(args.log_every_n_frames),
     )
 
-    image_tracker = SortWithExtras(
-        max_age=args.max_age,
-        min_hits=args.min_hits,
-        iou_threshold=args.iou_threshold,
-        alpha_distance=args.alpha_distance,
-        beta_heading=args.beta_heading,
-        gamma_confidence=args.gamma_confidence,
-        new_track_min_confidence=args.new_track_min_confidence,
+    image_tracker = ImageSpaceSort(
+        image_space_max_age=args.image_space_max_age,
+        image_space_min_hits=args.image_space_min_hits,
+        image_space_iou_threshold=args.image_space_iou_threshold,
+        image_space_alpha_distance=args.image_space_alpha_distance,
+        image_space_beta_heading=args.image_space_beta_heading,
+        image_space_gamma_confidence=args.image_space_gamma_confidence,
+        image_space_new_track_min_confidence=args.image_space_new_track_min_confidence,
     )
 
-    world_tracker: Optional[WorldSort] = None
+    world_tracker: Optional[WorldSpaceSort] = None
     ego_store: Optional[EgoStateStore] = None
     if cfg.mode == "world_space":
         ego_store = EgoStateStore(EgoSmoother())
-        world_tracker = WorldSort(
-            max_age=args.world_max_age,
-            min_hits=args.world_min_hits,
-            max_distance_m=args.world_max_distance_m,
-            beta_heading=args.world_beta_heading,
-            gamma_confidence=args.world_gamma_confidence,
-            new_track_min_confidence=args.world_new_track_min_confidence,
+        world_tracker = WorldSpaceSort(
+            world_space_max_age=args.world_space_max_age,
+            world_space_min_hits=args.world_space_min_hits,
+            world_space_max_distance_m=args.world_space_max_distance_m,
+            world_space_beta_heading=args.world_space_beta_heading,
+            world_space_gamma_confidence=args.world_space_gamma_confidence,
+            world_space_new_track_min_confidence=args.world_space_new_track_min_confidence,
         )
 
     try:
