@@ -2,3 +2,29 @@ output/
 mot_benchmark
 .venv
 MOT15
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments (common variants)
+venv/
+.venv/
+env/
+.env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# IDE / editor files
+*.code-workspace
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
