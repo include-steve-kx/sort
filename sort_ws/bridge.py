@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from dataclasses import dataclass
 from typing import Optional, Set, List, Dict, Any
@@ -31,8 +32,8 @@ class BridgeConfig:
 
     reconnect_delay_s: float = 1.0
 
-    # Tracking mode: "world_space" or "image_space"
-    mode: str = "world_space"
+    # Tracking mode: "auto", "world_space", or "image_space"
+    mode: str = "auto"
 
     # World-tracking / camera params (used when mode == "world_space")
     world_space_cv_width_px: int = 1920
@@ -77,6 +78,37 @@ class BroadcastHub:
                     self._clients.discard(ws)
 
 
+class TrackingModeState:
+    """
+    Shared, runtime-selectable tracking mode.
+
+    Modes:
+      - "auto": prefer world-space outputs when available, else fall back to image-space
+      - "world_space": output world-space tracked bboxes (may be empty until ego arrives)
+      - "image_space": output image-space tracked bboxes
+    """
+
+    def __init__(self, initial_mode: str = "auto"):
+        self._lock = asyncio.Lock()
+        self._mode = self._normalize(initial_mode)
+
+    @staticmethod
+    def _normalize(mode: str) -> str:
+        m = str(mode or "").strip().lower()
+        if m in ("auto", "world_space", "image_space"):
+            return m
+        return "auto"
+
+    async def get(self) -> str:
+        async with self._lock:
+            return self._mode
+
+    async def set(self, mode: str) -> str:
+        async with self._lock:
+            self._mode = self._normalize(mode)
+            return self._mode
+
+
 def _ws_url(host: str, port: int) -> str:
     return f"ws://{host}:{port}"
 
@@ -94,6 +126,7 @@ def _track_image_space(bboxes: list, tracker: ImageSpaceSort) -> List[Dict[str, 
         det2 = dict(det)
         det2.setdefault("source_obj_id", det2.get("obj_id"))
         det2["obj_id"] = int(track_id)
+        det2["tracked_space"] = "image_space"
         tracked_bboxes.append(det2)
     return tracked_bboxes
 
@@ -154,11 +187,13 @@ async def _track_world_space(
         det2 = dict(det)
         det2.setdefault("source_obj_id", det2.get("obj_id"))
         det2["obj_id"] = int(track_id)
+        det2["tracked_space"] = "world_space"
         tracked_bboxes.append(det2)
     return tracked_bboxes
 
 async def _upstream_video_loop(
     cfg: BridgeConfig,
+    mode_state: TrackingModeState,
     image_tracker: ImageSpaceSort,
     world_tracker: Optional[WorldSpaceSort],
     ego_store: Optional[EgoStateStore],
@@ -179,17 +214,30 @@ async def _upstream_video_loop(
                     if not isinstance(bboxes, list):
                         bboxes = []
 
-                    if cfg.mode == "world_space" and world_tracker is not None and ego_store is not None:
-                        tracked_bboxes = await _track_world_space(
+                    # Always compute image-space tracks.
+                    tracked_local = _track_image_space(bboxes, image_tracker)
+
+                    # Also compute world-space tracks when possible (may be empty until ego arrives).
+                    tracked_world: List[Dict[str, Any]] = []
+                    if world_tracker is not None and ego_store is not None:
+                        tracked_world = await _track_world_space(
                             bboxes=bboxes,
                             world_tracker=world_tracker,
                             ego_store=ego_store,
                             cfg=cfg,
                         )
-                        vm.metadata["tracked_space"] = "world_space"
-                    else:
-                        tracked_bboxes = _track_image_space(bboxes, image_tracker)
-                        vm.metadata["tracked_space"] = "image_space"
+
+                    # Choose which list goes into `bboxes`.
+                    mode = await mode_state.get()
+                    tracked_bboxes = tracked_local
+                    selected_space = "image_space"
+                    if mode == "world_space":
+                        tracked_bboxes = tracked_world
+                        selected_space = "world_space"
+                    elif mode == "auto":
+                        if tracked_world:
+                            tracked_bboxes = tracked_world
+                            selected_space = "world_space"
 
                     vm.metadata["bboxes"] = tracked_bboxes
                     vm.metadata["tracked"] = True
@@ -197,7 +245,7 @@ async def _upstream_video_loop(
                     await video_hub.broadcast(out_payload)
 
                     if cfg.log_every_n_frames and upstream_frame_count % int(cfg.log_every_n_frames) == 0:
-                        active = world_tracker if (cfg.mode == "world_space" and world_tracker is not None) else image_tracker
+                        active = world_tracker if (selected_space == "world_space" and world_tracker is not None) else image_tracker
                         try:
                             active_tracks = len(active.trackers)
                         except Exception:
@@ -231,7 +279,7 @@ async def _upstream_nmea_loop(
                 print(f"[sort-ws] Connected upstream NMEA: {url}")
                 async for msg in upstream:
                     # NMEA is JSON text in replay; forward as-is.
-                    if cfg.mode == "world_space" and ego_store is not None and isinstance(msg, str):
+                    if ego_store is not None and isinstance(msg, str):
                         await ego_store.update_from_nmea_json(msg)
                     await nmea_hub.broadcast(msg)
         except asyncio.CancelledError:
@@ -291,17 +339,51 @@ async def _downstream_control_handler(
     ws: WebSocketServerProtocol,
     control_hub: BroadcastHub,
     outbound_to_upstream: "asyncio.Queue[str]",
+    mode_state: TrackingModeState,
 ) -> None:
     await control_hub.register(ws)
     try:
+        # Send current mode to newly connected clients.
+        try:
+            await ws.send(json.dumps({"tracking_mode": await mode_state.get()}))
+        except Exception:
+            pass
+
         async for msg in ws:
-            # Forward downstream control commands upstream (pause/play/seek).
+            # Forward downstream control commands upstream (pause/play/seek),
+            # but intercept local tracking-mode changes.
             if isinstance(msg, (bytes, bytearray)):
                 try:
                     msg = msg.decode("utf-8")
                 except Exception:
                     continue
-            await outbound_to_upstream.put(str(msg))
+            msg_s = str(msg)
+            try:
+                obj = json.loads(msg_s)
+            except Exception:
+                obj = None
+
+            if isinstance(obj, dict):
+                cmd = str(obj.get("command") or obj.get("cmd") or "").strip().lower()
+                if cmd in ("set_tracking_mode", "set_mode", "set_tracked_space_mode"):
+                    requested = obj.get("mode") or obj.get("tracking_mode") or obj.get("tracked_space_mode") or "auto"
+                    new_mode = await mode_state.set(str(requested))
+                    notice = json.dumps({"tracking_mode": new_mode})
+                    try:
+                        await ws.send(json.dumps({"ack": "set_tracking_mode", "tracking_mode": new_mode}))
+                    except Exception:
+                        pass
+                    await control_hub.broadcast(notice)
+                    continue
+                if cmd in ("get_tracking_mode", "get_mode", "get_tracked_space_mode"):
+                    cur = await mode_state.get()
+                    try:
+                        await ws.send(json.dumps({"tracking_mode": cur}))
+                    except Exception:
+                        pass
+                    continue
+
+            await outbound_to_upstream.put(msg_s)
     finally:
         await control_hub.unregister(ws)
 
@@ -316,6 +398,7 @@ async def run_bridge(
     nmea_hub = BroadcastHub("nmea")
     control_hub = BroadcastHub("control")
     outbound_to_upstream: asyncio.Queue[str] = asyncio.Queue()
+    mode_state = TrackingModeState(cfg.mode)
 
     # Start downstream servers and keep the returned server objects alive.
     video_server = await websockets.serve(
@@ -331,7 +414,7 @@ async def run_bridge(
         max_size=None,
     )
     control_server = await websockets.serve(
-        lambda ws: _downstream_control_handler(ws, control_hub, outbound_to_upstream),
+        lambda ws: _downstream_control_handler(ws, control_hub, outbound_to_upstream, mode_state),
         cfg.downstream_bind,
         cfg.downstream_control_port,
         max_size=None,
@@ -348,7 +431,7 @@ async def run_bridge(
 
     try:
         await asyncio.gather(
-            _upstream_video_loop(cfg, image_tracker, world_tracker, ego_store, video_hub),
+            _upstream_video_loop(cfg, mode_state, image_tracker, world_tracker, ego_store, video_hub),
             _upstream_nmea_loop(cfg, nmea_hub, ego_store),
             _upstream_control_loop(cfg, control_hub, outbound_to_upstream),
         )
@@ -395,9 +478,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mode",
         type=str,
-        default="world_space",
-        choices=["world_space", "image_space"],
-        help='Tracking mode. "world_space" uses NMEA ego lat/lon/heading and tracks in ENU meters. "image_space" runs image-space SORT.',
+        default="auto",
+        choices=["auto", "world_space", "image_space"],
+        help='Tracking mode. "auto" prefers world-space outputs when available, else falls back to image-space. "world_space" uses NMEA ego lat/lon/heading and tracks in ENU meters. "image_space" runs image-space SORT.',
     )
     p.add_argument(
         "--world-space-cv-width-px",
@@ -492,18 +575,16 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         image_space_new_track_min_confidence=args.image_space_new_track_min_confidence,
     )
 
-    world_tracker: Optional[WorldSpaceSort] = None
-    ego_store: Optional[EgoStateStore] = None
-    if cfg.mode == "world_space":
-        ego_store = EgoStateStore(EgoSmoother())
-        world_tracker = WorldSpaceSort(
-            world_space_max_age=args.world_space_max_age,
-            world_space_min_hits=args.world_space_min_hits,
-            world_space_max_distance_m=args.world_space_max_distance_m,
-            world_space_beta_heading=args.world_space_beta_heading,
-            world_space_gamma_confidence=args.world_space_gamma_confidence,
-            world_space_new_track_min_confidence=args.world_space_new_track_min_confidence,
-        )
+    # Always initialize world-space tracking components so downstream can switch modes at runtime.
+    ego_store: Optional[EgoStateStore] = EgoStateStore(EgoSmoother())
+    world_tracker: Optional[WorldSpaceSort] = WorldSpaceSort(
+        world_space_max_age=args.world_space_max_age,
+        world_space_min_hits=args.world_space_min_hits,
+        world_space_max_distance_m=args.world_space_max_distance_m,
+        world_space_beta_heading=args.world_space_beta_heading,
+        world_space_gamma_confidence=args.world_space_gamma_confidence,
+        world_space_new_track_min_confidence=args.world_space_new_track_min_confidence,
+    )
 
     try:
         asyncio.run(run_bridge(cfg, image_tracker, world_tracker, ego_store))
